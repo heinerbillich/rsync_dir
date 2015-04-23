@@ -1,0 +1,447 @@
+#!/bin/bash --norc
+# /usr/local/bin/rsyncdir:
+# rsync script for SLS beamline linux media stations
+# continuously syncs a source directory to a target directory. The target directory
+# typically resides on an external USB or eSATA disk, the source directory on Data10/.
+#
+# usage: see function usage() below
+#
+# $Header: /afs/psi.ch/user/b/billich/work/puppet/gfa5/SLS/X_MediaStation/usr/local/bin/RCS/rsyncdir,v 1.1 2009/03/11 11:28:42 billich Exp billich $
+# Heiner Billich / PSI
+#
+# contact: Heiner.Billich@psi.ch
+#
+
+# set -x
+
+scriptname=$(basename $0)	# script's name
+typeset -i minpause=180		# how many seconds must pass at least between subsequent calls to rsync
+typeset -i timeout=600		# consider any rsync job hanging which runs for more than timeout seconds
+rsync=/usr/bin/rsync		# which rsync to use, use rsync268 if available in /usr/local/bin/
+[ -x /usr/local/bin/rsync268 ] && rsync=/usr/local/bin/rsync268
+# rsync="/exchange/system/WSLB-102/heiner/bl-sync-to-disk.d/sleeper 1000" # for debugging only
+rsync_options="-vW" 		# rsync options -W: whole files  more options added later when we know the file system type
+logfile="$HOME/${scriptname}$(date +-%F-)$$.log"
+debug=""			# empty string is false, don't turn on debugging by default
+quiet=""			# empty string is false, don't be quiet by default
+
+pid=""				# pid of last backgrounded rsync
+
+source=""			# source directories
+target=""			# target directory
+
+unalias -a			# clean-up shell, just in case
+set -u
+PATH=/bin:/usr/bin
+
+trap 'pkill -P $pid >/dev/null; kill $pid >/dev/null; exit' TERM INT HUP 	# clean-up on exit
+
+# -- usage() ---------------------------------------------------------------------------
+function usage () {
+   me=$scriptname
+   cat <<-EOF
+
+	usage:
+	$me [options] source-dir  target-dir
+	$me [options]
+
+	$me will copy source-dir into target-dir repeatedly until
+	terminated with Ctrl-C.
+	$me uses rsync, hence only changes or new files are copied.
+	If source-dir and target-dir aren't specified $me will ask for the
+	values and suggest some defaults.
+
+	options
+	-l logfile    default: $HOME/${me}-YYYY-MM-DD-<PID>.log. Use /dev/null to disable logging.
+	-d            debug, add debugging output: set -x
+	-q            quiet, little output to stdout
+	-r options    additional rsync options, just specify the single letter options, no leading dash "-"
+	-p nsec       pause at least nsec seconds between rsync calls, default is $minpause
+	-t nsec	      timeout and kill any rsync process which does run for more than $timeout seconds.
+        -h            print usage message and exit
+
+        all other options are passed to rsync. Example
+        $ rsyncdir --exclude=*.tmp Data10/. /media/mydisk
+
+        Place target-dir in quotes if it contains white space. Example:
+        $ rsyncdir some-dir  "/media/My Book"
+
+        Put source-dir in quotes if you use wildcards. Example:
+        $ rsyncdir "Data10/cat*" /media/mydisk
+
+	EOF
+
+   return 0
+}
+
+function log () {
+   echo "$*" >> $logfile
+   [ $quiet ] || echo "$*"
+}
+
+function errlog () {
+  echo "$(date +'%F %R') ERROR: $*" >> $logfile
+  echo "$scriptname ERROR: $*" 1>&2
+}
+
+# -- Main ---------------------------------------------------------------------
+
+# -- parse arguments ----------------------------------------------------------
+
+# while getopts ":l:dqrp:t:" opt; do
+#   case $opt in
+#   l) logfile=$OPTARG;;
+#   d) debug=true; set -x;;
+#   q) quiet=true;;
+#   r) rsync_options="$rsync_options -$OPTARG";;
+#   p) minpause=$OPTARG;;
+#   t) timeout=$OPTARG;;
+#   \?)  echo OPTARG=$OPTARG;;
+#   esac
+#done
+#shift $(($OPTIND - 1))
+#echo $*
+#exit
+
+# I want to pass all unknow options to rsync, including --longopt=test style options.
+# This doesn't work with getopt (??), hence do the parsing on my own.
+# this doesn't work with collated options like -dq
+while [[ $# -gt 0 && $1 = -* ]]
+do
+   case $1 in
+   -l) shift; logfile=$1; shift;;
+   -d) shift; debug=true; set -x;;
+   -q) shift; quiet=true;;
+   -r) shift; rsync_options="$rsync_options -$1"; shift;;
+   -p) shift; minpause=$1; shift;;
+   -t) shift; timeout=$1; shift;;
+   -h) shift; usage; exit;;
+   -*) rsync_options="$rsync_options $1"; shift;;
+   esac
+done
+
+if [ $# -eq 2 ]
+then
+  source="$1"
+  target="$2"
+  shift 2
+fi
+
+# -- basic checks
+
+if ! touch $logfile
+then
+ errlog "Can't create or write to logfile (-l) $logfile. Please check and start again. exiting."
+ exit 5
+fi
+
+if [ ! -x $rsync ]
+then
+ errlog "Can not execute $rsync. exit"
+ exit 6
+fi
+
+if [ $timeout -le 0 ]
+then
+  errlog "timeout (-t) $timeout not greater zero. exit"
+  exit 7
+fi
+
+if [ $minpause -lt 0 ]
+then
+  errlog "minpause (-p) $minpause is negative. exit"
+  exit 8
+fi
+
+if [ $minpause -gt 3600 ]
+then
+  errlog "minpause is larger than 3600 seconds, i.e. one hour. Are you sure ? continuing anyway ..."
+  sleep 5
+fi
+
+if [ $timeout -le $minpause ]
+then
+  errlog "timeout $timeout is less or equal minpause $minpause. Are you sure ? continuing anyway ..."
+  sleep 5
+fi
+
+if [ -z "$BEAMLINE_XNAME" ]
+then
+ if [ -r /etc/profile.d/sls_beamline.sh ]
+ then
+   . /etc/profile.d/sls_beamline.sh
+ fi
+fi
+
+if [ -z "$BEAMLINE_XNAME" ]
+then
+  errlog "BEAMLINE_XNAME is not set. exit"
+  exit 9
+fi
+
+# -- ask for source and target if not given on the cmd. line ----------------------------------------
+
+if [ -z "$source" -o -z "$target" ]
+then
+
+# -- external disk ?
+extdir=""    # path to mountpoint of external disk
+while [ -z $extdir ]
+do
+  default=$(df -Pl | grep /media/ | egrep -v "cdrecorder|floppy"| head -1 | awk '{ print $6 }')
+  [ -z $default ] && default="/media/usbdisk"
+  answer=""
+  echo
+  echo "Where is your external disk mounted ?"
+  echo "Please give the path or just type return to accept the default"
+  read -p "Path to external disk ? default=$default : " answer
+  if [ -z $answer ]
+  then
+    extdir=$default
+  else
+    extdir=$answer
+  fi
+  if [ ! -d $extdir/. ]
+  then
+    echo
+    echo ERROR: $extdir/. is no directory, please try again.
+    extdir=""
+  fi
+done
+
+# -- subdirectory on external disk ?
+extsubdir=""   # target directory on external disk
+while [ -z $extsubdir ]
+do
+  default="."
+  answer=""
+  echo
+  echo "To which (existing) directory on your external disk do you want to copy your data ?"
+  echo "Please give the path or just type return to accept the default"
+  echo "The default \"$default\" means to use no subdirectory"
+  read -p "directory on external disk ? default=\"$default\" : " answer
+  if [ -z $answer ]
+  then
+    extsubdir=$default
+  else
+    extsubdir=$answer
+  fi
+  if [ ! -d $extdir/$extsubdir -o ! -w $extdir/$extsubdir ]
+  then
+    echo
+    echo ERROR: $extdir/$extsubdir is no directory or is not writeable, please try again.
+    extsubdir=""
+  fi
+done
+
+# -- Data directory ?
+datadir=""
+while [ -z $datadir ]
+do
+  default="Data10"
+  answer=""
+  echo
+  echo "Which SLS Data disc will hold your data ?"
+  echo "Please type Data10 or Data1 or Data2 ... or just type return to accept the default"
+  read -p "SLS Data disk ? default=\"$default\" : " answer
+  if [ -z $answer ]
+  then
+    datadir=$default
+  else
+    datadir=$answer
+  fi
+  datadir=/sls/$BEAMLINE_XNAME/$datadir/$(id -nu)
+  if [ ! -d $datadir -o ! -r  $datadir ]
+  then
+    echo
+    echo ERROR: $datadir is no directory or is not readable, please try again.
+    datadir=""
+  fi
+done
+
+# -- subdirectory in Data directory ?
+datasubdir=""
+while [ -z $datasubdir ]
+do
+  default="."
+  answer=""
+  echo
+  echo "Which (existing) subdirectory on your SLS Data disc holds the data you want to copy ?"
+  echo "Please give the path or just type return to accept the default."
+  echo "The default \"$default\" means to sync your whole Data disc."
+  read -p "Subdirectory on SLS Data disk ? default=\"$default\" : " answer
+  if [ -z $answer ]
+  then
+    datasubdir=$default
+  else
+    datasubdir=$answer
+  fi
+  if [ ! -d $datadir/$datasubdir -o ! -r  $datadir/$datasubdir ]
+  then
+    echo
+    echo ERROR: $datadir/$datasubdir is no directory or is not readable, please try again.
+    datasubdir=""
+  fi
+done
+
+source=$datadir/$datasubdir
+target="$extdir/$extsubdir"
+echo
+echo "OK, no more input required"
+echo
+
+fi # [ -z $source -o -z $target ]
+
+# -- check source and target ------------------------------------------------------------------------
+
+
+source="${source%/}"  	# remove any trailing / which has a special meaning in rsync:
+			# we wan't to copy the directory, not it's content
+
+# use source/. if source is a symbolic link (like Data10 -> /sls/X10SA/Data10/e1....)
+if [ -L "$source" ]
+then
+  log $source is a symbolic link, using $source/. instead.
+  source=$source/.
+fi
+
+# $source may contain wildcards, hence it may expand into a list of directories
+# check each directory in list separately
+for d in $source
+do
+  if [ ! -d $d ]
+  then
+    errlog "$d is no directory. exit"
+    exit 10
+  fi
+  if [ ! -r $d -o ! -x $d ]
+  then
+    errlog "$d not readable or not executable. exit"
+    exit 15
+  fi
+done
+
+
+if [ ! -r "$target/." -o ! -x "$target/." -o ! -w "$target/." ]  # use /. just in case target is a symbolic link
+then
+  errlog "$target not read-, write- or executable. exit"
+  exit 15
+fi
+
+# -- check for msdos file system on target and add rsync options specific for msdos
+fstype=$(/usr/bin/stat -f -c %T "$target")
+if [ $fstype = msdos ]
+then
+ # msdos file system has no permissions and time stamp granularity is 2s. -rltgoD is equal to option -a minus -p
+ rsync_options="--modify-window=1 -rltoD $rsync_options"
+else
+ rsync_options="-a $rsync_options "
+ if $rsync --help | grep -q .--chmod
+ then
+   # change permissions: Allow other to read everything and to delete.
+   rsync_options="--chmod=o+rX,Do+w $rsync_options"
+ fi
+fi
+
+cmd="$rsync $rsync_options $source $target"  	# rsync command to use
+
+# --- log settings
+log ++
+log ++ $scriptname started
+log ++ at $(date +'%F %R') on $(uname -n) by $(id -nu)
+log ++
+log ++ settings:
+log ++ ---------
+log ++ source directory: "$source"
+log ++ target diretory : $target
+log ++
+log ++ logfile: $logfile
+log ++ minimum pause between subsequent rsync runs: $minpause seconds
+log ++ timeout rsync jobs which take longer than: $timeout seconds
+log ++ current directory: $(pwd)
+log ++
+log ++ rsync options: $rsync_options
+log ++ rsync command line: $cmd
+log ++
+# add some more information to the log only
+echo ++ ---------------------------------------------------------------------------- >> $logfile
+echo ++ >> $logfile
+echo ++ \$ df -h $source $target >> $logfile
+df -h $source "$target" | sed -e 's/^/++ /' >> $logfile
+echo ++ >> $logfile
+echo ++ \$ ls -lsd $source $target  >> $logfile
+ls -lsd $source "$target" | sed -e 's/^/++ /'  >> $logfile
+echo
+echo ++ >> $logfile
+echo ++ \$ /usr/bin/stat -f  "$target" >> $logfile
+/usr/bin/stat -f  "$target" | sed -e 's/^/++ /' >> $logfile
+echo ++ >> $logfile
+echo ++ \$ mount \|grep media >> $logfile
+mount | grep media | sed -e 's/^/++ /' >> $logfile
+
+# -- infinite  rsync loop --
+
+itt=1
+while true
+do
+  # start rsync
+  log ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  log ++++
+  log ++++ start rsync run $itt at $(date +"%F %R")
+  log ++++
+
+  echo ++++ \$ df -h /media/*                 >> $logfile
+  df -h /media/* 2>&1   | sed -e 's/^/++++ /' >> $logfile
+  echo ++++                                    >> $logfile
+  echo ++++ \$ ls -ls "$target"               >> $logfile
+  ls -ls "$target" 2>&1 | sed -e 's/^/++++ /' >> $logfile
+  echo ++++                                   >> $logfile
+
+  if [ $quiet ]
+  then
+     $rsync $rsync_options $source "$target" >> $logfile 2>&1 &
+    pid=$!
+  else
+    # start the two commands in a subshell.
+    ( $rsync $rsync_options $source "$target" | tee -a $logfile ) &
+    pid=$! # subshells pid, rsync and tee are children of the subshell
+  fi
+
+  # wait at least $minpause seconds befor we continue
+  sleep $minpause
+
+  # see if the last rsync is still running. Wait up to $timeout-$minpause more seconds if not
+  duration=$minpause
+  while [ $duration -lt $timeout ]
+  do
+    if ps -p $pid >/dev/null
+    then
+     sleep 1
+     duration=$((duration+1))
+    else
+     break
+    fi
+  done
+
+  [ $debug ] && ps -ef | grep $pid
+
+  # kill the job if it still runs
+  if  ps -p $pid >/dev/null
+  then
+    errlog "killing hanging rsync job after $timeout seconds"
+    ps -f $(pgrep -P $pid) $pid >> $logfile
+    # first kill the child processes - if any
+    pkill -P $pid >/dev/null 2>&1; sleep 1; pkill -HUP -P $pid >/dev/null 2>&1; sleep 1; pkill -KILL -P $pid  >/dev/null 2>&1
+    # next kill the process itself if still alive.
+    kill $pid >/dev/null 2>&1; sleep 1; kill -HUP $pid >/dev/null 2>&1; sleep 1; kill -KILL $pid  >/dev/null 2>&1
+    # if the OS spans a new unrelated process with the same pid for the same user between or before the subsequent
+    # pkill/kill we will kill the wrong process.
+
+    #
+  fi
+
+  itt=$((itt+1))
+done
+
+exit 0
+#EOF
