@@ -10,7 +10,7 @@ $ BEAMLINE_XNAME=XXX ./rsyncdir -h
 ```
 
 
-```bash
+```
 usage:
 rsyncdir [options] source-dir  target-dir
 rsyncdir [options]
